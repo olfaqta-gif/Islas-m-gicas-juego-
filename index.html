@@ -631,7 +631,8 @@ const Voice = (() => {
     return loading[w];
   }
   setTimeout(() => ['fabi', 'cami', 'vale', 'narr'].concat(Object.keys(IDX)).forEach(w => load(w)), 300);
-  let req = 0;
+  let req = 0, endAt = 0, curG = null, fadeEnd = 0, cur = { who: '', kind: '' };
+  const nowS = () => performance.now() / 1000;
   let first = null;
   function preload() {
     if (first) return first;
@@ -647,7 +648,15 @@ const Voice = (() => {
     const ss = sentences(t).map(x => ix[x]); return ss.length && ss.every(Boolean) ? ss : null;
   }
   function stop() {
-    req++; playing.forEach(s => { try { s.stop(); } catch (e) {} }); playing = []; clearTimeout(endT);
+    req++; endAt = 0; clearTimeout(endT);
+    // a line that has to stop fades out softly instead of being chopped
+    const ac = Snd.ctx;
+    if (ac && curG && playing.length) {
+      const t = ac.currentTime, g = curG.gain;
+      try { g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(0, t + .12); } catch (e) {}
+      playing.forEach(s => { try { s.stop(t + .14); } catch (e) {} }); fadeEnd = t + .1;
+    } else playing.forEach(s => { try { s.stop(); } catch (e) {} });
+    playing = []; curG = null;
     try { window.speechSynthesis && speechSynthesis.cancel(); } catch (e) {}
   }
   function tts(text, who) {
@@ -663,9 +672,9 @@ const Voice = (() => {
   return {
     preload,
     // returns how long the line lasts (0 if it is not known)
-    say(text, who) {
+    say(text, who, kind = 'blip') {
       if (!save.voice) return 0;
-      stop();
+      stop(); cur = { who: who && who.key, kind };
       const w = who && who.key, segs = w && plan(w, text), ac = Snd.ctx, id = ++req;
       // a recorded line always waits for its recording: never the robotic browser voice
       if (segs && ac) {
@@ -673,17 +682,23 @@ const Voice = (() => {
         const play = () => {
           if (id !== req || !buf[w]) return;
           if (!out) { out = ac.createGain(); out.gain.value = 1; out.connect(ac.destination); }
-          let t = ac.currentTime + .03;
-          for (const [s0, d] of segs) { const src = ac.createBufferSource(); src.buffer = buf[w]; src.connect(out); src.start(t, Math.max(0, s0 - .03), d + .14); playing.push(src); t += d + .12; }
+          curG = ac.createGain(); curG.connect(out);
+          let t = Math.max(ac.currentTime + .03, fadeEnd);
+          for (const [s0, d] of segs) { const src = ac.createBufferSource(); src.buffer = buf[w]; src.connect(curG); src.start(t, Math.max(0, s0 - .03), d + .14); playing.push(src); t += d + .12; }
           Snd.duck(true); clearTimeout(endT); endT = setTimeout(() => Snd.duck(false), total * 1000);
         };
-        if (buf[w]) { play(); return total; }
-        const l = load(w); if (l) { l.then(play); return total + .4; }
+        if (buf[w]) { play(); endAt = nowS() + total; return total; }
+        const l = load(w); if (l) { l.then(play); endAt = nowS() + total + .4; return total + .4; }
       }
       if (w && segs) load(w);
       if (!segs) (window.__vmiss = window.__vmiss || []).push(who + ': ' + text);
-      tts(text, who); return 0;
+      tts(text, who); endAt = nowS() + Math.max(1, text.split(/\s+/).length * .42); return 0;
     },
+    // seconds until the line now playing ends (0 when quiet)
+    busy: () => Math.max(0, endAt - nowS()),
+    cur: () => cur,
+    // how long a line will last, without playing it
+    len(text, who) { const segs = who && who.key && plan(who.key, text); return segs ? segs.reduce((a, [, d]) => a + d + .12, 0) : 0; },
     stop
   };
 })();
@@ -2123,9 +2138,41 @@ function updateGoal() {
   $('#goalText').textContent = `${v} / ${tg}`; $('#goalFill').style.width = (v / tg * 100) + '%';
 }
 let bubbleTimer = null;
+// one voice at a time: a new line waits for the one playing to finish instead of cutting it off
+const sayQ = []; let sayPump = null;
+function hush() { Voice.stop(); sayQ.length = 0; clearTimeout(sayPump); sayPump = null; }
+const voiceIdle = () => new Promise(r => { const f = () => (Voice.busy() > .05 || sayQ.length) ? setTimeout(f, 90) : r(); f(); });
+function pumpSay() {
+  clearTimeout(sayPump); sayPump = null; if (!sayQ.length) return;
+  const b = Voice.busy(); if (b > .05) { sayPump = setTimeout(pumpSay, b * 1000 + 160); return; }
+  const it = sayQ.shift(); if (it.scene === S) sayNow(it.who, it.text, it.o);
+  if (sayQ.length) sayPump = setTimeout(pumpSay, 200);
+}
 function say(who, text, o = {}) {
   const c = CH[who] || CH.narr;
-  const vd = o.voice !== false ? Voice.say(text, c) : 0;
+  if (o.cut) { hush(); return sayNow(who, text, o); }
+  if (o.voice === false || !save.voice) return sayNow(who, text, o);
+  const b = Voice.busy();
+  if (b <= .05 && !sayQ.length) return sayNow(who, text, o);
+  // queued: never more than three lines waiting, the oldest goes first
+  if (sayQ.length >= 3) sayQ.shift();
+  sayQ.push({ who, text, o, scene: S });
+  let t = b + .16; for (const q of sayQ) { const l = Voice.len(q.text, CH[q.who] || CH.narr) || Math.max(1.8, q.text.split(/\s+/).length * .42 + .5); if (q.text === text && q.who === who) break; t += l + .2; }
+  if (!sayPump) sayPump = setTimeout(pumpSay, b * 1000 + 160);
+  const own = Voice.len(text, c);
+  return t + (o.dur || (own ? own + .2 : Math.max(1.8, text.split(/\s+/).length * .42 + .5)));
+}
+// quick words when the child taps (numbers, letters, names): they never step on another character's line;
+// they only cut a long line of the same friend, because the child already answered it
+let tapT = null;
+function tapSay(text, c) {
+  clearTimeout(tapT); const b = Voice.busy(), cur = Voice.cur();
+  if (b <= .05 || cur.kind === 'blip' || (cur.who === c.key && b > .8) || b > 3) return Voice.say(text, c, 'blip');
+  tapT = setTimeout(() => tapSay(text, c), b * 1000 + 60); return 0;
+}
+function sayNow(who, text, o = {}) {
+  const c = CH[who] || CH.narr;
+  const vd = o.voice !== false ? Voice.say(text, c, 'line') : 0;
   const d = o.dur || (vd ? vd + .2 : Math.max(1.8, text.split(/\s+/).length * .42 + .5));
   if (!o.quiet) {
     ui.bubble.style.setProperty('--c', c.color);
@@ -2139,7 +2186,7 @@ function say(who, text, o = {}) {
 function hideBubble() { ui.bubble.hidden = true; $('#bubbleNext').hidden = true; hud.classList.remove('talking'); }
 let promptSpeech = null;
 function setPrompt(html, speech, who) { ui.prompt.hidden = false; ui.prompt.style.animation = 'none'; void ui.prompt.offsetWidth; ui.prompt.style.animation = ''; $('#promptText').innerHTML = html; promptSpeech = [who, speech]; if (speech) say(who, speech, { quiet: true }); }
-$('#btnHear').onclick = () => { Snd.click(); if (promptSpeech && promptSpeech[1]) say(promptSpeech[0], promptSpeech[1], { quiet: true }); };
+$('#btnHear').onclick = () => { Snd.click(); if (promptSpeech && promptSpeech[1]) say(promptSpeech[0], promptSpeech[1], { quiet: true, cut: true }); };
 function setDots(i, n = 5) { $('#dots').innerHTML = Array.from({ length: n }, (_, k) => `<i class="${k < i ? 'on' : ''}">${k < i ? ICON.star : k === i ? ICON.starNow : ICON.starOff}</i>`).join(''); }
 // a star flies from the stage to the counter
 function addStar(x, y) {
@@ -2198,7 +2245,7 @@ function showParents() {
     <label class="toggle"><input type="checkbox" id="chkMusic" ${save.music ? 'checked' : ''}> Música de fondo</label>
     <div class="row"><button class="btn sky" id="mIntro">Ver la intro</button><button class="btn danger" id="mReset">Borrar progreso</button><button class="btn sun" id="mClose">Cerrar</button></div></div>`, c => {
     c.querySelector('#mClose').onclick = () => { Snd.click(); closeModal(); };
-    c.querySelector('#chkVoice').onchange = e => { save.voice = e.target.checked; persist(); if (!save.voice) Voice.stop(); };
+    c.querySelector('#chkVoice').onchange = e => { save.voice = e.target.checked; persist(); if (!save.voice) hush(); };
     c.querySelector('#chkMusic').onchange = e => { Snd.setMusic(e.target.checked); $('#btnMusic').classList.toggle('off', !save.music); };
     c.querySelector('#mIntro').onclick = () => { Snd.click(); save.introSeen = false; persist(); go('title', { autoplay: true }); };
     const rb = c.querySelector('#mReset');
@@ -2271,7 +2318,7 @@ let going = false;
 async function go(name, arg) {
   if (Snd.ctx) Voice.preload();
   if (going) return; going = true;
-  Voice.stop(); Snd.whoosh();
+  hush(); Snd.whoosh();
   const R = Math.hypot(L.W, L.H) / 2 + 20, mi = ISLE[arg] || ISLE[save.isle] || ISLE.arcoiris;
   const col = (WORLD[name] && WORLD[name].color) || (name === 'map' ? mi.color : name === 'mundo' ? '#4FB8F0' : name === 'fiesta' ? '#FF6FA5' : '#FFC93C');
   irisPath.setAttribute('fill', col); irisSet(R); irisEl.hidden = false;
@@ -2402,13 +2449,13 @@ async function runIntro(s) {
   for (const st of INTRO) {
     if (s.dead || !s.intro) return;
     st.act(s);
-    const d = say(st.who, st.text, { sticky: true }); $('#bubbleNext').hidden = false;
+    const d = say(st.who, st.text, { sticky: true, cut: true }); $('#bubbleNext').hidden = false;
     await Promise.race([wait(d + .9), nextPress()]);
   }
   if (!s.dead && s.intro) finishIntro();
 }
 function finishIntro() {
-  save.introSeen = true; persist(); hideBubble(); Voice.stop();
+  save.introSeen = true; persist(); hideBubble(); hush();
   if (S && S.mode === 'title' && !S.logo) land(S); else go('title');
 }
 $('#btnSkip').onclick = () => { Snd.click(); finishIntro(); };
@@ -2743,8 +2790,8 @@ SCENES.numeros = () => {
     const nums = shuffle([n, ...wrong]), bc = ['#FF7EB6', '#55C97A', '#FF9A2A'];
     const blocks = nums.map((k, i) => { const b = sprite(PROP.numBlock(k, bc[i]), 760 + (i - 1) * 200, 1100, { w: 140, h: 154, anchor: 'center', z: 500, tap: () => tapNum(b) }); b.k = k; b.to({ y: 760 }, .6, { ease: ease.back, delay: .2 + i * .08 }); return b; });
     ask('¿Cuántos <b>pececitos</b> hay?', '¿Cuántos pececitos hay? Tócalos para contar.', 'pipo');
-    function tag(f, k) { const t = sprite(PROP.countTag(k), f.x, f.y - 46, { w: 58, anchor: 'center', z: 800, cls: 'pop' }); tags.push(t); f.num = k; f.anim('jump', 500); Snd.note(70 + k * 2, .35); Voice.say(NUM[k], CH.pipo); }
-    function tapFish(f) { if (done || s.locked) return; if (f.num) { f.anim('jump', 500); Voice.say(NUM[f.num], CH.pipo); return; } tag(f, ++count); }
+    function tag(f, k) { const t = sprite(PROP.countTag(k), f.x, f.y - 46, { w: 58, anchor: 'center', z: 800, cls: 'pop' }); tags.push(t); f.num = k; f.anim('jump', 500); Snd.note(70 + k * 2, .35); tapSay(NUM[k], CH.pipo); }
+    function tapFish(f) { if (done || s.locked) return; if (f.num) { f.anim('jump', 500); tapSay(NUM[f.num], CH.pipo); return; } tag(f, ++count); }
     async function tapNum(b) {
       if (done || s.locked) return;
       if (b.k === n) {
@@ -2754,7 +2801,7 @@ SCENES.numeros = () => {
       } else {
         bad(s, b, `Ese es el ${NUM[b.k]}. ¡Contemos juntos!`); s.locked = true;
         tags.forEach(t => t.remove()); tags.length = 0; fish.forEach(f => { f.num = 0; }); count = 0;
-        await wait(2.3);
+        await wait(2.3); await voiceIdle(); if (s.dead) return;
         for (const f of fish) { if (s.dead) return; tag(f, ++count); await wait(.8); }
         s.locked = false;
       }
@@ -2774,7 +2821,7 @@ SCENES.letras = () => {
   round(s, () => new Promise(res => {
     let target; do { target = pick(pool); } while (target === last); last = target;
     const opts = shuffle([target, ...shuffle(WORDS.filter(w => w.l !== target.l)).slice(0, 2)]); let done = false;
-    const sayL = () => { lc.anim('jump', 500); Voice.say(LNAME[target.l], CH.buho); };
+    const sayL = () => { lc.anim('jump', 500); tapSay(LNAME[target.l], CH.buho); };
     const lc = sprite(PROP.letterCard(target.l, isVowel(target.l)), 492, 476, { w: 264, h: 334, anchor: 'center', z: 300, cls: 'pop', tap: sayL });
     const cards = opts.map((o, k) => { const c = sprite(PROP.picCard(o.k, o.w), 780 + k * 212, 476, { w: 196, h: 237, anchor: 'center', z: 300 + k, cls: 'pop', tap: () => tapC(c) }); c.o = o; c.inn.style.animationDelay = .15 + k * .09 + 's'; return c; });
     Snd.whoosh();
@@ -2978,7 +3025,7 @@ SCENES.memoria = () => {
   (async () => { await wait(1.4); if (s.dead) return; await Promise.all(cards.map(c => turn(c, true))); await wait(peek); if (s.dead) return; await Promise.all(cards.map(c => turn(c, false))); busy = false; })();
   async function flip(sp) {
     if (busy || sp.open || sp.done || s.locked) return;
-    sp.open = true; Snd.click(); Voice.say(cap(nom(sp.k)), CH.zuri);
+    sp.open = true; Snd.click(); tapSay(cap(nom(sp.k)), CH.zuri);
     if (!first) { first = sp; sp.tp = turn(sp, true); return; }
     const a = first; first = null; busy = true; await Promise.all([a.tp, turn(sp, true)]);
     if (a.k === sp.k) {
@@ -3016,7 +3063,7 @@ SCENES.vocales = () => {
     if (!active || s.locked || b.dead) return;
     if (b.L !== target) { bad(s, b, `Esa es la ${b.L}. Busca la ${target}.`); return; }
     Snd.pop(); burst(b.x, b.y, 22, { kind: 'dot', colors: [cols[b.L], '#FFFFFF', '#DFF8FF'], speed: 420, g: 300, size: 14, life: .6 }); drop(b);
-    popped++; const tg = sprite(PROP.countTag(popped), b.x, b.y, { w: 56, anchor: 'center', z: 800, cls: 'pop' }); s.after(.7, () => tg.remove()); Voice.say(NUM[popped], CH.pulpi);
+    popped++; const tg = sprite(PROP.countTag(popped), b.x, b.y, { w: 56, anchor: 'center', z: 800, cls: 'pop' }); s.after(.7, () => tg.remove()); tapSay(NUM[popped], CH.pulpi);
     if (popped < need) return;
     active = false; const r = resolve; resolve = null;
     live.slice().forEach((o, j) => s.after(j * .06, () => { if (!o.dead) { burst(o.x, o.y, 8, { kind: 'dot', colors: ['#fff'], speed: 200, g: 200, size: 10, life: .4 }); drop(o); } }));
@@ -3262,7 +3309,7 @@ SCENES.patrones = () => {
   async function catchIt(o) {
     drop(o);
     if (o.k !== target) { Snd.boing(); basket.anim('wig', 500); const f = sprite(PIC[o.k], o.x, o.y, { w: 92, h: 92, anchor: 'center', z: 700 }); f.to({ y: o.y - 160, x: o.x + rand(-90, 90), rot: 200, alpha: 0 }, .6, { ease: ease.out }).then(() => f.remove()); bad(s, null, `¡Ese no! Atrapa solo ${CATCH[target]}.`); return; }
-    got++; Snd.pop(); basket.anim('jump', 500); sparkle(basket.x, 760, 10); Voice.say(NUM[got], CH.nieve);
+    got++; Snd.pop(); basket.anim('jump', 500); sparkle(basket.x, 760, 10); tapSay(NUM[got], CH.nieve);
     const tg = sprite(PROP.countTag(got), basket.x, 700, { w: 64, anchor: 'center', z: 900, cls: 'pop' }); tg.to({ y: 600, alpha: 0 }, 1.2, { ease: ease.in, delay: .3 }).then(() => tg.remove());
     if (got < need) return;
     active = false; live.slice().forEach(drop); const r = resolve; resolve = null;
@@ -3296,13 +3343,13 @@ SCENES.sombras = () => {
     s.bot = () => { const p = pieces.find(o => !o.fixed); const sl = p && slots.find(o => o.k === p.k); return p && [p.x, p.y, sl.x, sl.y]; };
     Snd.whoosh(); ask('Lleva cada uno a su <b style="--c:#C0621E">sombra</b>', 'Lleva cada uno a su sombra.', 'zuri');
     async function tryP(p, moved) {
-      if (!moved) { p.anim('jump', 500); Voice.say(cap(the(p.k)), CH.zuri); return goHome(p, .2); }
+      if (!moved) { p.anim('jump', 500); tapSay(cap(the(p.k)), CH.zuri); return goHome(p, .2); }
       const sl = slots.find(o => near(o, p.x, p.y, 110));
       if (!sl || sl.done) return goHome(p);
       if (sl.k !== p.k) { bad(s, sl, 'Esa no es su sombra. ¡Mira la forma!'); return goHome(p, .5); }
       p.fixed = true; sl.done = true; await p.to({ x: sl.x, y: sl.y - 4, sc: 170 / 150 }, .2, { ease: ease.out });
       Snd.pop(); sparkle(sl.x, sl.y, 14); sl.anim('jump', 500); p.anim('jump', 500); left--;
-      if (left) { Voice.say(cap(the(p.k)), CH.zuri); return; }
+      if (left) { tapSay(cap(the(p.k)), CH.zuri); return; }
       await good(s, 650, 250, pick(['¡Todos encontraron su sombra!', '¡Muy bien! Cada uno con su sombra.', '¡Eres una experta en sombras!']));
       await clearAll([...slots, ...pieces]); res();
     }
@@ -3370,7 +3417,7 @@ SCENES.sumas = () => {
         if (x !== camel.x) camel.flip = x > camel.x ? 1 : -1;
         cur = p[k]; await camel.to({ x, y }, .11, { ease: ease.lin });
         const co = cocos.find(o => !o.dead && o.cell[0] === cur[0] && o.cell[1] === cur[1]);
-        if (co) { got++; Snd.pop(); sparkle(x, y, 8); Voice.say(NUM[got], CH.zuri); co.to({ y: y - 60, sc: 0 }, .35, { ease: ease.in }).then(() => co.remove()); }
+        if (co) { got++; Snd.pop(); sparkle(x, y, 8); tapSay(NUM[got], CH.zuri); co.to({ y: y - 60, sc: 0 }, .35, { ease: ease.in }).then(() => co.remove()); }
         if (cur[0] === goal[0] && cur[1] === goal[1]) { finish(); return; }
       }
     }
@@ -3415,7 +3462,7 @@ SCENES.mezclas = () => {
     if (moved && !near(bowl, p.x, p.y + 60, 190)) return goHome(p);
     p.busy = true; await p.to({ x: bowl.x + 70, y: bowl.y - 130, rot: -38 }, .3, { ease: ease.io });
     burst(bowl.x + 24, bowl.y - 70, 14, { kind: 'dot', colors: [PAINT[p.k]], speed: 160, g: 900, size: 14, life: .5, dir: Math.PI / 2, spread: .4 });
-    Snd.pop(); inBowl.push(p.k); Voice.say(cap(p.k), CH.tuki);
+    Snd.pop(); inBowl.push(p.k); tapSay(cap(p.k), CH.tuki);
     bowl.inn.innerHTML = PROP.bowl(inBowl.length === 1 ? PAINT[p.k] : PAINT[mixOf(inBowl[0], inBowl[1])]); bowl.anim('jump', 500);
     await wait(.25); p.to({ rot: 0 }, .2); await goHome(p);
     if (inBowl.length < 2) return;
@@ -3520,7 +3567,7 @@ SCENES.frutas = () => {
     if ((have[f.k] || 0) >= it[1]) { bad(s, f, `¡Ya tenemos ${fruitN(it[1], f.k)}!`); return goHome(f, .5); }
     f.busy = true; await f.to({ x: bl.x, y: bl.y - 340, sc: .7 }, .3, { ease: ease.io }); await f.to({ y: bl.y - 220, sc: .3, alpha: 0 }, .2, { ease: ease.in });
     have[f.k] = (have[f.k] || 0) + 1; cols.push(FRUIT[f.k][2]); total++;
-    Snd.pop(); bl.inn.innerHTML = PROP.blender(avgCol(cols), level() * .8); bl.anim('jump', 500); card.inn.innerHTML = PROP.recipe(list, have); Voice.say(NUM[have[f.k]], CH.tuki);
+    Snd.pop(); bl.inn.innerHTML = PROP.blender(avgCol(cols), level() * .8); bl.anim('jump', 500); card.inn.innerHTML = PROP.recipe(list, have); tapSay(NUM[have[f.k]], CH.tuki);
     f.x = f.home[0]; f.y = f.home[1] + 30; f.sc = f.sc0; f.el.style.opacity = 1; f.alpha = 1; f.set(); f.anim('pop', 600); await wait(.2); f.busy = false; f.z = f.zz; f.el.style.zIndex = f.z;
     if (list.some(([k, n]) => (have[k] || 0) < n)) return;
     const r = resolve; resolve = null;
@@ -3835,7 +3882,7 @@ SCENES.pastel = () => {
     async function place(o) {
       if (phase !== 'place' || o.fixed) return; o.fixed = true; const [x, y] = slots[placed++], n = placed;
       await o.to({ x, y: y - 40, sc: 1 }, .35, { ease: ease.io }); o.el.classList.remove('bob'); o.z = 600 + n; o.el.style.zIndex = o.z;
-      Snd.pop(); countTag(s, x, y - 140, n); Voice.say(NUM[n], CH.gomi); sparkle(x, y - 10, 6);
+      Snd.pop(); countTag(s, x, y - 140, n); tapSay(NUM[n], CH.gomi); sparkle(x, y - 10, 6);
       if (n === N) light();
     }
     async function light() {
@@ -3884,13 +3931,13 @@ SCENES.gomitas = () => {
       g.to({ y: 330 + (k % 2) * 70 }, .6 + k * .08, { ease: ease.back }).then(() => { g.home = [g.x, g.y]; g.busy = false; }); return g;
     });
     async function drop(g, moved) {
-      if (!moved) { Voice.say(`¡${cap(g.c)}!`, CH.gomi); g.anim('squish', 500); return goHome(g); }
+      if (!moved) { tapSay(`¡${cap(g.c)}!`, CH.gomi); g.anim('squish', 500); return goHome(g); }
       let jar = null, bd = 150; for (const j of jars) { const d = Math.hypot(j.x - g.x, j.y - 120 - g.y); if (d < bd) { bd = d; jar = j; } }
       if (!jar) return goHome(g);
       if (jar.c !== g.c) { bad(s, jar, 'Ese frasco es de otro color.'); g.anim('wig', 500); return goHome(g); }
       g.fixed = true; await g.to({ x: jar.x, y: jar.y - 200, sc: .7 }, .25, { ease: ease.io }); await g.to({ y: jar.y - 110, sc: .4 }, .2, { ease: ease.in }); g.remove();
       jar.n++; jar.inn.innerHTML = candyJarArt(GUMMY[jar.c], jar.n); jar.anim('squish', 500); Snd.pop(); sparkle(jar.x, jar.y - 160, 8);
-      Voice.say(`¡${cap(g.c)}!`, CH.gomi);
+      tapSay(`¡${cap(g.c)}!`, CH.gomi);
       if (--left) return;
       s.bot = null; await good(s, 760, 520); await clearAll(jars); res();
     }
@@ -3958,7 +4005,7 @@ SCENES.estrellas = () => {
     async function hit(st) {
       if (s.locked || st.lit) return;
       if (st.k !== next) { bad(s, st, next ? `Busca el ${NUM[next + 1]}.` : 'Toca las estrellas en orden.'); return; }
-      st.lit = true; st.el.classList.add('lit'); Snd.sparkle && Snd.pop(); sparkle(st.x, st.y, 6); Voice.say(NUM[next + 1], CH.chispa);
+      st.lit = true; st.el.classList.add('lit'); Snd.sparkle && Snd.pop(); sparkle(st.x, st.y, 6); tapSay(NUM[next + 1], CH.chispa);
       if (next > 0) line(P[next - 1], P[next]);
       if (++next < n) return;
       s.bot = null; s.locked = true; line(P[n - 1], P[0]); await wait(.6);
@@ -4036,7 +4083,7 @@ SCENES.luciernagas = () => {
       if (!active || f.gone || s.locked) return;
       if (col && f.c !== col) { bad(s, f, `¡Esa no! Busca las ${FLY_PL[col]}.`); return; }
       f.gone = true; const n = ++got; Snd.pop(); sparkle(f.x, f.y, 6);
-      Voice.say(NUM[n], CH.chispa); countTag(s, f.x, f.y - 60, n);
+      tapSay(NUM[n], CH.chispa); countTag(s, f.x, f.y - 60, n);
       f.to({ x: 760, y: 680, sc: .35 }, .45, { ease: ease.io }).then(() => { f.remove(); jar.inn.innerHTML = lanternArt(n, FLY[tc]); jar.anim('squish', 500); });
       if (n < N) return;
       active = false; s.bot = null;
@@ -4204,7 +4251,7 @@ WORLDS.splice(WORLDS.findIndex(w => w.id === 'frutas') + 1, 0, { id: 'palmas', i
 WORLD.palabras = WORLDS.find(w => w.id === 'palabras'); WORLD.palmas = WORLDS.find(w => w.id === 'palmas');
 
 /* ---------------- Isla Burbujas: Arma la palabra con Pulpi ---------------- */
-const PAL_EASY = ['sol', 'oso', 'pez', 'casa', 'luna', 'pato', 'gato', 'uvas', 'dado', 'nube', 'vaca'];
+const PAL_EASY = ['sol', 'oso', 'casa', 'luna', 'pato', 'gato', 'uvas', 'dado', 'nube', 'vaca'];
 const PAL_ALL = PAL_EASY.concat(['isla', 'coco', 'pera', 'pino', 'tina', 'fresa', 'barco', 'globo', 'libro', 'pulpo', 'botas']);
 const LN = l => LNAME[l];
 SCENES.palabras = () => {
@@ -4213,7 +4260,7 @@ SCENES.palabras = () => {
   const bag = shuffle((L0 < 1 ? PAL_EASY : PAL_ALL).slice());
   let word = '', pos = 0, slots = [], letters = [], pic = null, resolve = null, missHere = 0;
   s.bot = () => { if (!resolve) return null; const b = letters.find(o => !o.fixed && !o.busy && o.L === word[pos].toUpperCase()); return b && [b.x, b.y, b.x, b.y]; };
-  const sayW = () => { if (pic) pic.anim('jump', 500); Voice.say(`¡${cap(word)}!`, CH.pulpi); };
+  const sayW = () => { if (pic) pic.anim('jump', 500); tapSay(`¡${cap(word)}!`, CH.pulpi); };
   function showGhost(k) { const sl = slots[k]; if (sl && !sl.ghost) { sl.ghost = true; sl.inn.innerHTML = PROP.slot(word[k].toUpperCase(), true); } }
   function nextGlow() { slots.forEach((o, k) => o.el.classList.toggle('pulse', k === pos)); }
   async function drop(b, moved) {
@@ -4224,13 +4271,13 @@ SCENES.palabras = () => {
     if (b.L !== need) { missHere++; bad(s, b, `Esa es la ${LN(b.L)}. Busca la ${LN(need)}.`); if (missHere >= (L0 < 3 ? 1 : 2)) showGhost(pos); return goHome(b, .5); }
     b.fixed = true; b.busy = true; b.el.classList.remove('bob'); missHere = 0;
     await b.to({ x: sl.x, y: sl.y, sc: 1 }, .35, { ease: ease.back }); b.z = 600; b.el.style.zIndex = 600;
-    Snd.pop(); sparkle(sl.x, sl.y, 8, [letCol(need), '#fff']); Voice.say(LN(need), CH.pulpi);
+    Snd.pop(); sparkle(sl.x, sl.y, 8, [letCol(need), '#fff']); tapSay(LN(need), CH.pulpi);
     pos++; nextGlow();
     if (pos < word.length) return;
     const r = resolve; resolve = null; s.locked = true; await wait(.7);
     const placed = letters.filter(o => o.fixed);
     for (const o of placed.sort((a, c) => a.x - c.x)) { o.anim('jump', 500); Snd.note(72 + placed.indexOf(o) * 2, .2); await wait(.16); }
-    s.locked = false; sayW(); await wait(.9);
+    s.locked = false; await wait(.3);
     await good(s, 930, 300, `¡${cap(word)}! ${pick(PRAISE)}`);
     await clearAll([pic, ...slots, ...letters]); r();
   }
@@ -4264,8 +4311,9 @@ SCENES.palmas = () => {
   s.bot = () => { if (!resolve || busy) return null; const c = cards.find(o => o.n === syl.length); return c && [c.x, c.y, c.x, c.y]; };
   async function claps(show) {
     const id = ++clapId; busy = true;
+    await voiceIdle(); if (s.dead || id !== clapId) return;
     chips.forEach(c => c.remove()); chips = [];
-    const text = syl.join(', '), d = Voice.say(text, CH.tuki), T = (typeof SYL_T !== 'undefined' && d && SYL_T[text]) || syl.map((_, k) => k * .62);
+    const text = syl.join(', '), d = Voice.say(text, CH.tuki, 'line'), T = (typeof SYL_T !== 'undefined' && d && SYL_T[text]) || syl.map((_, k) => k * .62);
     const t0 = performance.now(), cw = 150, cx0 = 560 - (syl.length - 1) * cw / 2;
     for (let k = 0; k < syl.length; k++) {
       const dt = T[k] * 1000 - (performance.now() - t0); if (dt > 0) await wait(dt / 1000);
@@ -4302,12 +4350,12 @@ const SYL_T = {"sol":[0.0],"pez":[0.0],"ga, to":[0.0,1.07],"lu, na":[0.0,0.84],"
 
 /* ---------------- Arranque ---------------- */
 resize(); requestAnimationFrame(frame);
-document.addEventListener('visibilitychange', () => { if (document.hidden) Voice.stop(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) hush(); });
 document.addEventListener('contextmenu', e => e.preventDefault());
 setTimeout(() => { resize.hintDone = true; const r = $('#rotHint'); if (r) r.hidden = true; }, 9000);
 const fontsReady = document.fonts && document.fonts.ready ? Promise.race([document.fonts.ready, sleepReal(1800)]) : Promise.resolve();
 fontsReady.then(() => { SCENES.title(); });
-window.__game = { go, get S() { return S; }, get save() { return save; }, tweens, L, burst, sur: k => SUR[k](S, STICKERS[0]) };
+window.__game = { go, get S() { return S; }, get save() { return save; }, tweens, L, burst, sur: k => SUR[k](S, STICKERS[0]), V: Voice };
 })();
 
 </script>
